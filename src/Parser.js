@@ -1,85 +1,140 @@
 // @flow
-/* eslint no-constant-condition:0 */
 import functions from "./functions";
-import MacroExpander, {implicitCommands} from "./MacroExpander";
-import symbols, {ATOMS, extraLatin} from "./symbols";
-import {validUnit} from "./units";
-import {supportedCodepoint} from "./unicodeScripts";
+import symbols, {ATOMS} from "./symbols";
 import ParseError from "./ParseError";
-import {combiningDiacriticalMarksEndRegex} from "./Lexer";
+import Lexer from "./Lexer";
 import Settings from "./Settings";
-import SourceLocation from "./SourceLocation";
-import {uSubsAndSups, unicodeSubRegEx} from "./unicodeSupOrSub";
 import {Token} from "./Token";
 
-// Pre-evaluate both modules as unicodeSymbols require String.normalize()
-import unicodeAccents from /*preval*/ "./unicodeAccents";
-import unicodeSymbols from /*preval*/ "./unicodeSymbols";
-
-import type {ParseNode, AnyParseNode, SymbolParseNode, UnsupportedCmdParseNode}
-    from "./parseNode";
+import type {AnyParseNode} from "./parseNode";
 import type {Atom, Group} from "./symbols";
-import type {Mode, ArgType, BreakToken} from "./types";
-import type {FunctionContext, FunctionSpec} from "./defineFunction";
-import type {EnvSpec} from "./defineEnvironment";
+import type {Mode} from "./types";
 
-/**
- * This file contains the parser used to parse out a TeX expression from the
- * input. Since TeX isn't context-free, standard parsers don't work particularly
- * well.
- *
- * The strategy of this parser is as such:
- *
- * The main functions (the `.parse...` ones) take a position in the current
- * parse string to parse tokens from. The lexer (found in Lexer.js, stored at
- * this.gullet.lexer) also supports pulling out tokens at arbitrary places. When
- * individual tokens are needed at a position, the lexer is called to pull out a
- * token, which is then used.
- *
- * The parser has a property called "mode" indicating the mode that
- * the parser is currently in. Currently it has to be one of "math" or
- * "text", which denotes whether the current environment is a math-y
- * one or a text-y one (e.g. inside \text). Currently, this serves to
- * limit the functions which can be used in text mode.
- *
- * The main functions then return an object which contains the useful data that
- * was parsed at its given point, and a new position at the end of the parsed
- * data. The main functions can call each other and continue the parsing by
- * using the returned position as a new starting point.
- *
- * There are also extra `.handle...` functions, which pull out some reused
- * functionality into self-contained functions.
- *
- * The functions return ParseNodes.
- */
+const COMPARISON_OPERATORS = new Set([
+    "=", "==", "!=", "<", "<=", ">", ">=", "->", "<-", "<->", "=>", "<=>",
+]);
+const ADDITIVE_OPERATORS = new Set(["+", "-"]);
+const MULTIPLICATIVE_OPERATORS = new Set(["*", "/"]);
+const NON_PREFIX_TOKENS = new Set([
+    "+", "-", "*", "/", "^", "_", "=", "==", "!=", "<", "<=", ">", ">=",
+]);
+
+const OPERATOR_SYMBOL_MAP = {
+    "*": "\\cdot",
+    "==": "=",
+    "!=": "\\ne",
+    "<=": "\\leq",
+    ">=": "\\geq",
+    "->": "\\to",
+    "<-": "\\leftarrow",
+    "<->": "\\leftrightarrow",
+    "=>": "\\Rightarrow",
+    "<=>": "\\Leftrightarrow",
+};
+
+// Common Typst symbol names mapped to existing KaTeX symbols/operators.
+const NAMED_SYMBOLS = {
+    alpha: "\\alpha",
+    beta: "\\beta",
+    gamma: "\\gamma",
+    delta: "\\delta",
+    epsilon: "\\epsilon",
+    zeta: "\\zeta",
+    eta: "\\eta",
+    theta: "\\theta",
+    iota: "\\iota",
+    kappa: "\\kappa",
+    lambda: "\\lambda",
+    mu: "\\mu",
+    nu: "\\nu",
+    xi: "\\xi",
+    pi: "\\pi",
+    rho: "\\rho",
+    sigma: "\\sigma",
+    tau: "\\tau",
+    upsilon: "\\upsilon",
+    phi: "\\phi",
+    chi: "\\chi",
+    psi: "\\psi",
+    omega: "\\omega",
+    Gamma: "\\Gamma",
+    Delta: "\\Delta",
+    Theta: "\\Theta",
+    Lambda: "\\Lambda",
+    Xi: "\\Xi",
+    Pi: "\\Pi",
+    Sigma: "\\Sigma",
+    Upsilon: "\\Upsilon",
+    Phi: "\\Phi",
+    Psi: "\\Psi",
+    Omega: "\\Omega",
+    oo: "\\infty",
+    infty: "\\infty",
+};
+
+// Operator names that already have KaTeX handlers.
+const NAMED_OPERATORS = {
+    sin: "\\sin",
+    cos: "\\cos",
+    tan: "\\tan",
+    ln: "\\ln",
+    log: "\\log",
+    exp: "\\exp",
+    lim: "\\lim",
+    max: "\\max",
+    min: "\\min",
+    sum: "\\sum",
+    prod: "\\prod",
+    int: "\\int",
+};
+
+const ACCENT_CALLS = {
+    hat: "\\hat",
+    bar: "\\bar",
+    tilde: "\\tilde",
+    dot: "\\dot",
+    ddot: "\\ddot",
+    vec: "\\vec",
+    overline: "\\overline",
+    underline: "\\underline",
+};
+
+const ACCENT_NAME_MAP = {
+    hat: "\\hat",
+    bar: "\\bar",
+    tilde: "\\tilde",
+    dot: "\\dot",
+    ddot: "\\ddot",
+    vec: "\\vec",
+    arrow: "\\vec",
+    acute: "\\acute",
+    grave: "\\grave",
+    check: "\\check",
+    breve: "\\breve",
+    overline: "\\overline",
+    underline: "\\underline",
+};
 
 export default class Parser {
     mode: Mode;
-    gullet: MacroExpander;
+    lexer: Lexer;
     settings: Settings;
-    leftrightDepth: number;
     nextToken: ?Token;
+    definitions: {[string]: AnyParseNode[]};
 
     constructor(input: string, settings: Settings) {
-        // Start in math mode
         this.mode = "math";
-        // Create a new macro expander (gullet) and (indirectly via that) also a
-        // new lexer (mouth) for this parser (stomach, in the language of TeX)
-        this.gullet = new MacroExpander(input, settings, this.mode);
-        // Store the settings for use in parsing
+        this.lexer = new Lexer(input, settings);
         this.settings = settings;
-        // Count leftright depth (for \middle errors)
-        this.leftrightDepth = 0;
+        this.nextToken = null;
+        this.definitions = {};
     }
 
-    /**
-     * Checks a result to make sure it has the right type, and throws an
-     * appropriate error otherwise.
-     */
     expect(text: string, consume?: boolean = true) {
         if (this.fetch().text !== text) {
             throw new ParseError(
-                `Expected '${text}', got '${this.fetch().text}'`, this.fetch()
+                `Expected '${text}', got '${this.fetch().text}'`,
+                this.fetch(),
             );
         }
         if (consume) {
@@ -87,958 +142,824 @@ export default class Parser {
         }
     }
 
-    /**
-     * Discards the current lookahead token, considering it consumed.
-     */
     consume() {
         this.nextToken = null;
     }
 
-    /**
-     * Return the current lookahead token, or if there isn't one (at the
-     * beginning, or if the previous lookahead token was consume()d),
-     * fetch the next token as the new lookahead token and return it.
-     */
     fetch(): Token {
         if (this.nextToken == null) {
-            this.nextToken = this.gullet.expandNextToken();
+            this.nextToken = this.lexer.lex();
         }
         return this.nextToken;
     }
 
-    /**
-     * Switches between "text" and "math" modes.
-     */
     switchMode(newMode: Mode) {
         this.mode = newMode;
-        this.gullet.switchMode(newMode);
     }
 
     /**
-     * Main parsing function, which parses an entire input.
+     * Parses statement list and returns the last expression result.
+     *
+     * Supported statement form:
+     *   let name = expr;
      */
     parse(): AnyParseNode[] {
-        if (!this.settings.globalGroup) {
-            // Create a group namespace for the math expression.
-            // (LaTeX creates a new group for every $...$, $$...$$, \[...\].)
-            this.gullet.beginGroup();
-        }
+        let lastExpression: AnyParseNode[] = [];
 
-        // Use old \color behavior (same as LaTeX's \textcolor) if requested.
-        // We do this within the group for the math expression, so it doesn't
-        // pollute settings.macros.
-        if (this.settings.colorIsTextColor) {
-            this.gullet.macros.set("\\color", "\\textcolor");
-        }
-
-        try {
-            // Try to parse the input
-            const parse = this.parseExpression(false);
-
-            // If we succeeded, make sure there's an EOF at the end
-            this.expect("EOF");
-
-            // End the group namespace for the expression
-            if (!this.settings.globalGroup) {
-                this.gullet.endGroup();
+        while (this.fetch().text !== "EOF") {
+            if (this.isLetStatement()) {
+                this.parseLetStatement();
+            } else {
+                lastExpression = this.parseExpression(new Set([";", "EOF"]));
             }
 
-            return parse;
-
-        // Close any leftover groups in case of a parse error.
-        } finally {
-            this.gullet.endGroups();
+            if (this.fetch().text === ";") {
+                this.consume();
+            } else if (this.fetch().text !== "EOF") {
+                throw new ParseError(
+                    "Expected ';' or end of input",
+                    this.fetch(),
+                );
+            }
         }
+
+        this.expect("EOF");
+        return lastExpression;
     }
 
-    /**
-     * Fully parse a separate sequence of tokens as a separate job.
-     * Tokens should be specified in reverse order, as in a MacroDefinition.
-     */
-    subparse(tokens: Token[]): AnyParseNode[] {
-        // Save the next token from the current job.
-        const oldToken = this.nextToken;
+    isLetStatement(): boolean {
+        const token = this.fetch();
+        return token.kind === "identifier" && token.text === "let";
+    }
+
+    parseLetStatement() {
+        this.consume(); // let
+
+        const nameToken = this.fetch();
+        if (nameToken.kind !== "identifier") {
+            throw new ParseError("Expected identifier after 'let'", nameToken);
+        }
+        const name = nameToken.text;
         this.consume();
 
-        // Run the new job, terminating it with an excess '}'
-        this.gullet.pushToken(new Token("}"));
-        this.gullet.pushTokens(tokens);
-        const parse = this.parseExpression(false);
-        this.expect("}");
-
-        // Restore the next token from the current job.
-        this.nextToken = oldToken;
-
-        return parse;
+        this.expect("=");
+        const value = this.parseExpression(new Set([";", "EOF"]));
+        this.definitions[name] = this.cloneNodes(value);
     }
 
-    static endOfExpression: Set<string> =
-        new Set(["}", "\\endgroup", "\\end", "\\right", "&"]);
+    parseExpression(stopTokens: Set<string>): AnyParseNode[] {
+        return this.parseComparison(stopTokens);
+    }
 
-    /**
-     * Parses an "expression", which is a list of atoms.
-     *
-     * `breakOnInfix`: Should the parsing stop when we hit infix nodes? This
-     *                 happens when functions have higher precedence than infix
-     *                 nodes in implicit parses.
-     *
-     * `breakOnTokenText`: The text of the token that the expression should end
-     *                     with, or `null` if something else should end the
-     *                     expression.
-     */
-    parseExpression(
-        breakOnInfix: boolean,
-        breakOnTokenText?: BreakToken,
-    ): AnyParseNode[] {
-        const body = [];
-        // Keep adding atoms to the body until we can't parse any more atoms (either
-        // we reached the end, a }, or a \right)
-        while (true) {
-            // Ignore spaces in math mode
-            if (this.mode === "math") {
-                this.consumeSpaces();
+    parseComparison(stopTokens: Set<string>): AnyParseNode[] {
+        let left = this.parseAdditive(stopTokens);
+        while (!stopTokens.has(this.fetch().text) &&
+            COMPARISON_OPERATORS.has(this.fetch().text)) {
+            const operatorToken = this.fetch();
+            this.consume();
+            const right = this.parseAdditive(stopTokens);
+            if (right.length === 0) {
+                throw new ParseError(
+                    "Expected expression after comparison operator",
+                    operatorToken,
+                );
             }
-            const lex = this.fetch();
-            if (Parser.endOfExpression.has(lex.text)) {
+            left = left.concat([this.makeOperatorNode(operatorToken)])
+                .concat(right);
+        }
+        return left;
+    }
+
+    parseAdditive(stopTokens: Set<string>): AnyParseNode[] {
+        let left = this.parseMultiplicative(stopTokens);
+        while (!stopTokens.has(this.fetch().text) &&
+            ADDITIVE_OPERATORS.has(this.fetch().text)) {
+            const operatorToken = this.fetch();
+            this.consume();
+            const right = this.parseMultiplicative(stopTokens);
+            if (right.length === 0) {
+                throw new ParseError(
+                    "Expected expression after additive operator",
+                    operatorToken,
+                );
+            }
+            left = left.concat([this.makeOperatorNode(operatorToken)])
+                .concat(right);
+        }
+        return left;
+    }
+
+    parseMultiplicative(stopTokens: Set<string>): AnyParseNode[] {
+        let left = this.parseUnary(stopTokens);
+        if (left.length === 0) {
+            return left;
+        }
+
+        let keepParsing = true;
+        while (keepParsing) {
+            const token = this.fetch();
+            const text = token.text;
+
+            if (text === "EOF" || stopTokens.has(text) ||
+                COMPARISON_OPERATORS.has(text) || ADDITIVE_OPERATORS.has(text)) {
                 break;
             }
-            if (breakOnTokenText && lex.text === breakOnTokenText) {
-                break;
-            }
-            if (breakOnInfix && functions[lex.text] && functions[lex.text].infix) {
-                break;
-            }
-            const atom = this.parseAtom(breakOnTokenText);
-            if (!atom) {
-                break;
-            } else if (atom.type === "internal") {
-                // Internal nodes do not appear in parse tree
+
+            if (MULTIPLICATIVE_OPERATORS.has(text)) {
+                this.consume();
+                const right = this.parseUnary(stopTokens);
+                if (right.length === 0) {
+                    throw new ParseError(
+                        "Expected expression after multiplicative operator",
+                        token,
+                    );
+                }
+
+                if (text === "/") {
+                    const numer = this.nodesToArgument(left);
+                    const denom = this.nodesToArgument(right);
+                    left = [this.callFunction("\\frac", [numer, denom], [], token)];
+                } else {
+                    left = left.concat([this.makeOperatorNode(token)])
+                        .concat(right);
+                }
                 continue;
             }
-            body.push(atom);
-        }
-        if (this.mode === "text") {
-            this.formLigatures(body);
-        }
-        return this.handleInfixNodes(body);
-    }
 
-    /**
-     * Rewrites infix operators such as \over with corresponding commands such
-     * as \frac.
-     *
-     * There can only be one infix operator per group.  If there's more than one
-     * then the expression is ambiguous.  This can be resolved by adding {}.
-     */
-    handleInfixNodes(body: AnyParseNode[]): AnyParseNode[] {
-        let overIndex = -1;
-        let funcName;
-
-        for (let i = 0; i < body.length; i++) {
-            if (body[i].type === "infix") {
-                if (overIndex !== -1) {
-                    throw new ParseError(
-                        "only one infix operator per group",
-                        body[i].token);
+            // Juxtaposition in Typst math behaves as implicit multiplication.
+            if (this.canStartPrimary(token, stopTokens)) {
+                const right = this.parseUnary(stopTokens);
+                if (right.length === 0) {
+                    break;
                 }
-                overIndex = i;
-                funcName = body[i].replaceWith;
+                left = left.concat(right);
+                continue;
             }
+
+            keepParsing = false;
         }
 
-        if (overIndex !== -1 && funcName) {
-            let numerNode;
-            let denomNode;
-
-            const numerBody = body.slice(0, overIndex);
-            const denomBody = body.slice(overIndex + 1);
-
-            if (numerBody.length === 1 && numerBody[0].type === "ordgroup") {
-                numerNode = numerBody[0];
-            } else {
-                numerNode = {type: "ordgroup", mode: this.mode, body: numerBody};
-            }
-
-            if (denomBody.length === 1 && denomBody[0].type === "ordgroup") {
-                denomNode = denomBody[0];
-            } else {
-                denomNode = {type: "ordgroup", mode: this.mode, body: denomBody};
-            }
-
-            let node;
-            if (funcName === "\\\\abovefrac") {
-                node = this.callFunction(funcName,
-                    [numerNode, body[overIndex], denomNode], []);
-            } else {
-                node = this.callFunction(funcName, [numerNode, denomNode], []);
-            }
-            return [node];
-        } else {
-            return body;
-        }
+        return left;
     }
 
-    /**
-     * Handle a subscript or superscript with nice errors.
-     */
-    handleSupSubscript(
-        name: string,   // For error reporting.
-    ): AnyParseNode {
-        const symbolToken = this.fetch();
-        const symbol = symbolToken.text;
-        this.consume();
-        this.consumeSpaces(); // ignore spaces before sup/subscript argument
-
-        // Skip over allowed internal nodes such as \relax
-        let group: ?AnyParseNode;
-        do {
-            group = this.parseGroup(name);
-        } while (group?.type === "internal");
-
-        if (!group) {
-            throw new ParseError(
-                "Expected group after '" + symbol + "'",
-                symbolToken
-            );
+    parseUnary(stopTokens: Set<string>): AnyParseNode[] {
+        const token = this.fetch();
+        if (token.text === "EOF" || stopTokens.has(token.text)) {
+            return [];
         }
 
-        return group;
+        if (token.text === "+") {
+            this.consume();
+            return this.parseUnary(stopTokens);
+        }
+
+        if (token.text === "-") {
+            this.consume();
+            const body = this.parseUnary(stopTokens);
+            if (body.length === 0) {
+                throw new ParseError("Expected expression after unary '-'", token);
+            }
+            return [this.makeOperatorNode(token)].concat(body);
+        }
+
+        return this.parsePostfix(stopTokens);
     }
 
-    /**
-     * Converts the textual input of an unsupported command into a text node
-     * contained within a color node whose color is determined by errorColor
-     */
-    formatUnsupportedCmd(text: string): UnsupportedCmdParseNode {
-        const textordArray = [];
-
-        for (let i = 0; i < text.length; i++) {
-            textordArray.push({type: "textord", mode: "text", text: text[i]});
+    parsePostfix(stopTokens: Set<string>): AnyParseNode[] {
+        const base = this.parsePrimary(stopTokens);
+        if (base == null) {
+            return [];
         }
-
-        const textNode = {
-            type: "text",
-            mode: this.mode,
-            body: textordArray,
-        };
-
-        const colorNode = {
-            type: "color",
-            mode: this.mode,
-            color: this.settings.errorColor,
-            body: [textNode],
-        };
-
-        return colorNode;
-    }
-
-    /**
-     * Parses a group with optional super/subscripts.
-     */
-    parseAtom(breakOnTokenText?: BreakToken): ?AnyParseNode {
-        // The body of an atom is an implicit group, so that things like
-        // \left(x\right)^2 work correctly.
-        const base = this.parseGroup("atom", breakOnTokenText);
-
-        // Internal nodes (e.g. \relax) cannot support super/subscripts.
-        // Instead we will pick up super/subscripts with blank base next round.
-        if (base?.type === "internal") {
-            return base;
-        }
-
-        // In text mode, we don't have superscripts or subscripts
-        if (this.mode === "text") {
-            return base;
-        }
-
-        // Note that base may be empty (i.e. null) at this point.
 
         let superscript;
         let subscript;
-        while (true) {
-            // Guaranteed in math mode, so eat any spaces first.
-            this.consumeSpaces();
 
-            // Lex the first token
-            const lex = this.fetch();
+        while (this.fetch().text === "^" || this.fetch().text === "_") {
+            const token = this.fetch();
+            this.consume();
 
-            if (lex.text === "\\limits" || lex.text === "\\nolimits") {
-                // We got a limit control
-                if (base && base.type === "op") {
-                    const limits = lex.text === "\\limits";
-                    base.limits = limits;
-                    base.alwaysHandleSupSub = true;
-                } else if (base && base.type === "operatorname") {
-                    if (base.alwaysHandleSupSub) {
-                        base.limits = lex.text === "\\limits";
-                    }
-                } else {
-                    throw new ParseError(
-                        "Limit controls must follow a math operator",
-                        lex);
-                }
-                this.consume();
-            } else if (lex.text === "^") {
-                // We got a superscript start
+            const script = this.parseScriptArgument();
+            if (token.text === "^") {
                 if (superscript) {
-                    throw new ParseError("Double superscript", lex);
+                    throw new ParseError("Double superscript", token);
                 }
-                superscript = this.handleSupSubscript("superscript");
-            } else if (lex.text === "_") {
-                // We got a subscript start
-                if (subscript) {
-                    throw new ParseError("Double subscript", lex);
-                }
-                subscript = this.handleSupSubscript("subscript");
-            } else if (lex.text === "'") {
-                // We got a prime
-                if (superscript) {
-                    throw new ParseError("Double superscript", lex);
-                }
-                const prime = {type: "textord", mode: this.mode, text: "\\prime"};
-
-                // Many primes can be grouped together, so we handle this here
-                const primes = [prime];
-                this.consume();
-                // Keep lexing tokens until we get something that's not a prime
-                while (this.fetch().text === "'") {
-                    // For each one, add another prime to the list
-                    primes.push(prime);
-                    this.consume();
-                }
-                // If there's a superscript following the primes, combine that
-                // superscript in with the primes.
-                if (this.fetch().text === "^") {
-                    primes.push(this.handleSupSubscript("superscript"));
-                }
-                // Put everything into an ordgroup as the superscript
-                superscript = {type: "ordgroup", mode: this.mode, body: primes};
-            } else if (uSubsAndSups[lex.text]) {
-                // A Unicode subscript or superscript character.
-                // We treat these similarly to the unicode-math package.
-                // So we render a string of Unicode (sub|super)scripts the
-                // same as a (sub|super)script of regular characters.
-                const isSub = unicodeSubRegEx.test(lex.text);
-                const subsupTokens = [];
-                subsupTokens.push(new Token(uSubsAndSups[lex.text]));
-                this.consume();
-                // Continue fetching tokens to fill out the string.
-                while (true) {
-                    const token = this.fetch().text;
-                    if (!(uSubsAndSups[token])) { break; }
-                    if (unicodeSubRegEx.test(token) !== isSub) { break; }
-                    subsupTokens.unshift(new Token(uSubsAndSups[token]));
-                    this.consume();
-                }
-                // Now create a (sub|super)script.
-                const body = this.subparse(subsupTokens);
-                if (isSub) {
-                    subscript = {type: "ordgroup", mode: "math", body};
-                } else {
-                    superscript = {type: "ordgroup", mode: "math", body};
-                }
+                superscript = script;
             } else {
-                // If it wasn't ^, _, or ', stop parsing super/subscripts
-                break;
+                if (subscript) {
+                    throw new ParseError("Double subscript", token);
+                }
+                subscript = script;
             }
         }
 
-        // Base must be set if superscript or subscript are set per logic above,
-        // but need to check here for type check to pass.
         if (superscript || subscript) {
-            // If we got either a superscript or subscript, create a supsub
-            return {
+            return [{
                 type: "supsub",
                 mode: this.mode,
-                base: base,
+                base,
                 sup: superscript,
                 sub: subscript,
-            };
-        } else {
-            // Otherwise return the original body
-            return base;
+            }];
         }
+
+        return [base];
     }
 
-    /**
-     * Parses an entire function, including its base and all of its arguments.
-     */
-    parseFunction(
-        breakOnTokenText?: BreakToken,
-        name?: string, // For determining its context
-    ): ?AnyParseNode {
+    parseScriptArgument(): AnyParseNode {
+        if (this.fetch().text === "{") {
+            this.consume();
+            const body = this.parseExpression(new Set(["}"]));
+            this.expect("}");
+            return this.nodesToArgument(body);
+        }
+
+        const script = this.parseUnary(new Set([
+            "EOF", ";", ",", ")", "]", "}",
+            "+", "-", "*", "/", "^", "_",
+            "=", "==", "!=", "<", "<=", ">",
+            ">=", "->", "<-", "<->", "=>", "<=>",
+        ]));
+
+        if (script.length === 0) {
+            throw new ParseError(
+                "Expected expression after script marker",
+                this.fetch(),
+            );
+        }
+
+        return this.nodesToArgument(script);
+    }
+
+    parsePrimary(stopTokens: Set<string>): ?AnyParseNode {
         const token = this.fetch();
-        const func = token.text;
-        const funcData = functions[func];
-        if (!funcData) {
+
+        if (token.text === "EOF" || stopTokens.has(token.text)) {
             return null;
         }
-        this.consume(); // consume command token
 
-        if (name && name !== "atom" && !funcData.allowedInArgument) {
-            throw new ParseError(
-                "Got function '" + func + "' with no arguments" +
-                (name ? " as " + name : ""), token);
-        } else if (this.mode === "text" && !funcData.allowedInText) {
-            throw new ParseError(
-                "Can't use function '" + func + "' in text mode", token);
-        } else if (this.mode === "math" && funcData.allowedInMath === false) {
-            throw new ParseError(
-                "Can't use function '" + func + "' in math mode", token);
+        if (token.kind === "identifier") {
+            return this.parseIdentifier(token);
         }
 
-        const {args, optArgs} = this.parseArguments(func, funcData);
-        return this.callFunction(func, args, optArgs, token, breakOnTokenText);
+        if (token.kind === "number") {
+            this.consume();
+            return {
+                type: "textord",
+                mode: this.mode,
+                loc: token.loc,
+                text: token.text,
+            };
+        }
+
+        if (token.kind === "string") {
+            this.consume();
+            return this.makeTextNode(token.text, token);
+        }
+
+        if (token.text === "(") {
+            return this.parseVisibleGroup("(", ")");
+        }
+        if (token.text === "[") {
+            return this.parseVisibleGroup("[", "]");
+        }
+        if (token.text === "{") {
+            this.consume();
+            const body = this.parseExpression(new Set(["}"]));
+            this.expect("}");
+            return {
+                type: "ordgroup",
+                mode: this.mode,
+                body,
+            };
+        }
+
+        if (token.text === ")" || token.text === "]" || token.text === "}") {
+            return null;
+        }
+
+        if (NON_PREFIX_TOKENS.has(token.text)) {
+            return null;
+        }
+
+        // Fall back to symbol parsing for punctuation/operators that are
+        // meaningful as literal math symbols.
+        this.consume();
+        return this.makeSymbolNode(token.text, token);
     }
 
-    /**
-     * Call a function handler with a suitable context and arguments.
-     */
+    parseVisibleGroup(open: string, close: string): AnyParseNode {
+        const openToken = this.fetch();
+        this.consume();
+
+        const inner = this.parseExpression(new Set([close]));
+        const closeToken = this.fetch();
+        this.expect(close);
+
+        const openNode = this.makeSymbolNode(
+            this.normalizeDelimiter(open),
+            openToken,
+        );
+        const closeNode = this.makeSymbolNode(
+            this.normalizeDelimiter(close),
+            closeToken,
+        );
+        return this.makeOrdGroup([openNode].concat(inner).concat([closeNode]));
+    }
+
+    parseIdentifier(token: Token): AnyParseNode {
+        this.consume();
+        const name = token.text;
+
+        if (this.fetch().text === "(") {
+            return this.parseCall(name, token);
+        }
+
+        if (this.definitions[name]) {
+            return this.nodesToArgument(this.cloneNodes(this.definitions[name]));
+        }
+
+        if (NAMED_SYMBOLS.hasOwnProperty(name)) {
+            return this.makeSymbolNode(NAMED_SYMBOLS[name], token);
+        }
+
+        if (NAMED_OPERATORS.hasOwnProperty(name)) {
+            return this.callFunction(NAMED_OPERATORS[name], [], [], token);
+        }
+
+        if (name.length === 1) {
+            return this.makeSymbolNode(name, token);
+        }
+
+        const body = [];
+        for (let i = 0; i < name.length; i++) {
+            const charToken = new Token(name[i], token.loc, "identifier");
+            body.push(this.makeSymbolNode(name[i], charToken));
+        }
+        return this.makeOrdGroup(body);
+    }
+
+    parseCall(name: string, nameToken: Token): AnyParseNode {
+        if (name === "cases") {
+            return this.parseCasesCall(nameToken);
+        }
+
+        const args = this.parseCallArguments();
+
+        if (name === "frac") {
+            if (args.length !== 2) {
+                throw new ParseError(
+                    "frac() expects exactly 2 arguments",
+                    nameToken,
+                );
+            }
+            return this.callFunction(
+                "\\frac",
+                [this.nodesToArgument(args[0]), this.nodesToArgument(args[1])],
+                [],
+                nameToken,
+            );
+        }
+
+        if (name === "sqrt") {
+            if (args.length !== 1) {
+                throw new ParseError(
+                    "sqrt() expects exactly 1 argument",
+                    nameToken,
+                );
+            }
+            return this.callFunction(
+                "\\sqrt",
+                [this.nodesToArgument(args[0])],
+                [null],
+                nameToken,
+            );
+        }
+
+        if (name === "root") {
+            if (args.length !== 2) {
+                throw new ParseError(
+                    "root() expects exactly 2 arguments",
+                    nameToken,
+                );
+            }
+            return this.callFunction(
+                "\\sqrt",
+                [this.nodesToArgument(args[1])],
+                [this.nodesToArgument(args[0])],
+                nameToken,
+            );
+        }
+
+        if (name === "accent") {
+            return this.parseAccentCall(args, nameToken);
+        }
+
+        if (ACCENT_CALLS.hasOwnProperty(name)) {
+            if (args.length !== 1) {
+                throw new ParseError(
+                    `${name}() expects exactly 1 argument`,
+                    nameToken,
+                );
+            }
+            return this.callFunction(
+                ACCENT_CALLS[name],
+                [this.nodesToArgument(args[0])],
+                [],
+                nameToken,
+            );
+        }
+
+        if (name === "abs" || name === "norm" ||
+            name === "floor" || name === "ceil") {
+            if (args.length !== 1) {
+                throw new ParseError(
+                    `${name}() expects exactly 1 argument`,
+                    nameToken,
+                );
+            }
+            return this.makeDelimiterNode(name, args[0]);
+        }
+
+        if (NAMED_OPERATORS.hasOwnProperty(name)) {
+            const opNode = this.callFunction(
+                NAMED_OPERATORS[name],
+                [],
+                [],
+                nameToken,
+            );
+            const callSuffix = this.makeParenthesizedArgsNode(args);
+            return this.makeOrdGroup([opNode, callSuffix]);
+        }
+
+        // Fallback: render as `name(args...)` using literal symbols.
+        const fallbackNameNode = name.length === 1
+            ? this.makeSymbolNode(name, nameToken)
+            : this.makeOrdGroup(name.split("").map(ch =>
+                this.makeSymbolNode(
+                    ch,
+                    new Token(ch, nameToken.loc, "identifier"),
+                )
+            ));
+        const fallbackCall = this.makeParenthesizedArgsNode(args);
+        return this.makeOrdGroup([fallbackNameNode, fallbackCall]);
+    }
+
+    parseCallArguments(): AnyParseNode[][] {
+        this.expect("(");
+        const args = [];
+
+        if (this.fetch().text !== ")") {
+            let keepParsing = true;
+            while (keepParsing) {
+                args.push(this.parseExpression(new Set([",", ")"])));
+                if (this.fetch().text === ",") {
+                    this.consume();
+                } else {
+                    keepParsing = false;
+                }
+            }
+        }
+
+        this.expect(")");
+        return args;
+    }
+
+    parseCasesCall(nameToken: Token): AnyParseNode {
+        this.expect("(");
+        const rows: AnyParseNode[][][] = [];
+        let row: AnyParseNode[][] = [];
+
+        if (this.fetch().text !== ")") {
+            let keepParsing = true;
+            while (keepParsing) {
+                const cell = this.parseExpression(new Set([",", ";", ")"]));
+                row.push(cell);
+
+                if (this.fetch().text === ",") {
+                    this.consume();
+                    continue;
+                }
+                if (this.fetch().text === ";") {
+                    this.consume();
+                    rows.push(row);
+                    row = [];
+                    continue;
+                }
+                keepParsing = false;
+            }
+        }
+
+        if (row.length > 0) {
+            rows.push(row);
+        }
+        this.expect(")");
+
+        if (rows.length === 0) {
+            throw new ParseError("cases() expects at least one case", nameToken);
+        }
+
+        let maxCols = 1;
+        for (let i = 0; i < rows.length; i++) {
+            if (rows[i].length > maxCols) {
+                maxCols = rows[i].length;
+            }
+        }
+
+        const cols = [];
+        for (let i = 0; i < maxCols; i++) {
+            cols.push({
+                type: "align",
+                align: "l",
+                pregap: 0,
+                postgap: i === 0 && maxCols > 1 ? 1.0 : 0,
+            });
+        }
+
+        const body = rows.map((cells) => {
+            const normalized = cells.slice();
+            while (normalized.length < maxCols) {
+                normalized.push([]);
+            }
+
+            return normalized.map((cell) => ({
+                type: "styling",
+                mode: this.mode,
+                style: "text",
+                body: [this.nodesToArgument(cell)],
+            }));
+        });
+
+        const rowGaps = [];
+        for (let i = 0; i < Math.max(0, body.length - 1); i++) {
+            rowGaps.push(null);
+        }
+
+        const hLinesBeforeRow = [];
+        for (let i = 0; i < body.length + 1; i++) {
+            hLinesBeforeRow.push([]);
+        }
+
+        const arrayNode = {
+            type: "array",
+            mode: this.mode,
+            arraystretch: 1.2,
+            cols,
+            body,
+            rowGaps,
+            hLinesBeforeRow,
+        };
+
+        return {
+            type: "leftright",
+            mode: this.mode,
+            body: [arrayNode],
+            left: "\\{",
+            right: ".",
+            rightColor: undefined,
+        };
+    }
+
+    parseAccentCall(args: AnyParseNode[][], nameToken: Token): AnyParseNode {
+        if (args.length !== 2) {
+            throw new ParseError("accent() expects exactly 2 arguments", nameToken);
+        }
+
+        const base = this.nodesToArgument(args[0]);
+        const accentName = this.extractPlainText(args[1]);
+        if (!accentName) {
+            throw new ParseError(
+                "accent() second argument must be a simple identifier or string",
+                nameToken,
+            );
+        }
+
+        const command = ACCENT_NAME_MAP[accentName.trim().toLowerCase()];
+        if (!command) {
+            throw new ParseError(
+                `Unsupported accent type '${accentName}'`,
+                nameToken,
+            );
+        }
+
+        return this.callFunction(command, [base], [], nameToken);
+    }
+
+    makeParenthesizedArgsNode(args: AnyParseNode[][]): AnyParseNode {
+        const body = [];
+        for (let i = 0; i < args.length; i++) {
+            if (i > 0) {
+                body.push(
+                    this.makeSymbolNode(
+                        ",",
+                        new Token(",", null, "punctuation"),
+                    ),
+                );
+            }
+            body.push(this.nodesToArgument(args[i]));
+        }
+        return this.makeOrdGroup([
+            this.makeSymbolNode("(", new Token("(", null, "punctuation")),
+            ...body,
+            this.makeSymbolNode(")", new Token(")", null, "punctuation")),
+        ]);
+    }
+
+    makeDelimiterNode(name: string, argument: AnyParseNode[]): AnyParseNode {
+        let left;
+        let right;
+        if (name === "abs") {
+            left = "|";
+            right = "|";
+        } else if (name === "norm") {
+            left = "\\|";
+            right = "\\|";
+        } else if (name === "floor") {
+            left = "\\lfloor";
+            right = "\\rfloor";
+        } else {
+            left = "\\lceil";
+            right = "\\rceil";
+        }
+        return {
+            type: "leftright",
+            mode: this.mode,
+            body: argument,
+            left,
+            right,
+            rightColor: undefined,
+        };
+    }
+
+    makeTextNode(text: string, token: Token): AnyParseNode {
+        const body = [];
+        for (let i = 0; i < text.length; i++) {
+            body.push({
+                type: "textord",
+                mode: "text",
+                text: text[i],
+            });
+        }
+        return {
+            type: "text",
+            mode: this.mode,
+            loc: token.loc,
+            body,
+        };
+    }
+
+    makeOperatorNode(token: Token): AnyParseNode {
+        const mapped = OPERATOR_SYMBOL_MAP[token.text] || token.text;
+        return this.makeSymbolNode(mapped, token);
+    }
+
+    normalizeDelimiter(delim: string): string {
+        if (delim === "{") {
+            return "\\{";
+        }
+        if (delim === "}") {
+            return "\\}";
+        }
+        return delim;
+    }
+
+    makeOrdGroup(body: AnyParseNode[]): AnyParseNode {
+        return {
+            type: "ordgroup",
+            mode: this.mode,
+            body,
+        };
+    }
+
+    nodesToArgument(nodes: AnyParseNode[]): AnyParseNode {
+        if (nodes.length === 1) {
+            return nodes[0];
+        }
+        return this.makeOrdGroup(nodes);
+    }
+
+    canStartPrimary(token: Token, stopTokens: Set<string>): boolean {
+        if (token.text === "EOF" || stopTokens.has(token.text)) {
+            return false;
+        }
+        if (token.kind === "identifier" ||
+            token.kind === "number" ||
+            token.kind === "string") {
+            return true;
+        }
+        return token.text === "(" || token.text === "[" || token.text === "{";
+    }
+
+    makeSymbolNode(text: string, token: Token): AnyParseNode {
+        if (symbols[this.mode][text]) {
+            const symbolEntry = symbols[this.mode][text];
+            const group: Group = symbolEntry.group;
+            if (ATOMS.hasOwnProperty(group)) {
+                const family: Atom = (group: any);
+                return {
+                    type: "atom",
+                    mode: this.mode,
+                    family,
+                    loc: token.loc,
+                    text,
+                };
+            }
+            return {
+                type: (group: any),
+                mode: this.mode,
+                loc: token.loc,
+                text,
+            };
+        }
+
+        // If no predefined symbol exists, keep it as a text ord to avoid
+        // dropping user content in the subset parser.
+        return {
+            type: "textord",
+            mode: this.mode,
+            loc: token.loc,
+            text,
+        };
+    }
+
     callFunction(
         name: string,
         args: AnyParseNode[],
         optArgs: (?AnyParseNode)[],
         token?: Token,
-        breakOnTokenText?: BreakToken,
     ): AnyParseNode {
-        const context: FunctionContext = {
+        const func = functions[name];
+        if (!func || !func.handler) {
+            throw new ParseError(`Unsupported function '${name}'`, token);
+        }
+        return func.handler({
             funcName: name,
             parser: this,
             token,
-            breakOnTokenText,
-        };
-        const func = functions[name];
-        if (func && func.handler) {
-            return func.handler(context, args, optArgs);
-        } else {
-            throw new ParseError(`No function handler for ${name}`);
-        }
+            breakOnTokenText: undefined,
+        }, args, optArgs);
     }
 
-    /**
-     * Parses the arguments of a function or environment
-     */
-    parseArguments(
-        func: string,   // Should look like "\name" or "\begin{name}".
-        funcData: FunctionSpec<*> | EnvSpec<*>,
-    ): {
-        args: AnyParseNode[],
-        optArgs: (?AnyParseNode)[],
-    } {
-        const totalArgs = funcData.numArgs + funcData.numOptionalArgs;
-        if (totalArgs === 0) {
-            return {args: [], optArgs: []};
-        }
+    extractPlainText(nodes: AnyParseNode[]): ?string {
+        const chunks = [];
 
-        const args = [];
-        const optArgs = [];
-
-        for (let i = 0; i < totalArgs; i++) {
-            let argType = funcData.argTypes && funcData.argTypes[i];
-            const isOptional = i < funcData.numOptionalArgs;
-
-            if ((funcData.primitive && argType == null) ||
-                // \sqrt expands into primitive if optional argument doesn't exist
-                (funcData.type === "sqrt" && i === 1 && optArgs[0] == null)) {
-                argType = "primitive";
+        const walk = (node: AnyParseNode): boolean => {
+            if (node.type === "textord" ||
+                node.type === "mathord" ||
+                node.type === "atom") {
+                chunks.push(node.text);
+                return true;
             }
-
-            const arg = this.parseGroupOfType(`argument to '${func}'`,
-                argType, isOptional);
-            if (isOptional) {
-                optArgs.push(arg);
-            } else if (arg != null) {
-                args.push(arg);
-            } else { // should be unreachable
-                throw new ParseError("Null argument, please report this as a bug");
-            }
-        }
-
-        return {args, optArgs};
-    }
-
-    /**
-     * Parses a group when the mode is changing.
-     */
-    parseGroupOfType(
-        name: string,
-        type: ?ArgType,
-        optional: boolean,
-    ): ?AnyParseNode {
-        switch (type) {
-            case "color":
-                return this.parseColorGroup(optional);
-            case "size":
-                return this.parseSizeGroup(optional);
-            case "url":
-                return this.parseUrlGroup(optional);
-            case "math":
-            case "text":
-                return this.parseArgumentGroup(optional, type);
-            case "hbox": {
-                // hbox argument type wraps the argument in the equivalent of
-                // \hbox, which is like \text but switching to \textstyle size.
-                const group = this.parseArgumentGroup(optional, "text");
-                return group != null ? {
-                    type: "styling",
-                    mode: group.mode,
-                    body: [group],
-                    style: "text", // simulate \textstyle
-                } : null;
-            }
-            case "raw": {
-                const token = this.parseStringGroup("raw", optional);
-                return token != null ? {
-                    type: "raw",
-                    mode: "text",
-                    string: token.text,
-                } : null;
-            }
-            case "primitive": {
-                if (optional) {
-                    throw new ParseError("A primitive argument cannot be optional");
+            if (node.type === "ordgroup") {
+                for (let i = 0; i < node.body.length; i++) {
+                    if (!walk(node.body[i])) {
+                        return false;
+                    }
                 }
-                const group = this.parseGroup(name);
-                if (group == null) {
-                    throw new ParseError("Expected group as " + name, this.fetch());
-                }
-                return group;
+                return true;
             }
-            case "original":
-            case null:
-            case undefined:
-                return this.parseArgumentGroup(optional);
-            default:
-                throw new ParseError(
-                    "Unknown group type as " + name, this.fetch());
-        }
-    }
-
-    /**
-     * Discard any space tokens, fetching the next non-space token.
-     */
-    consumeSpaces() {
-        while (this.fetch().text === " ") {
-            this.consume();
-        }
-    }
-
-    /**
-     * Parses a group, essentially returning the string formed by the
-     * brace-enclosed tokens plus some position information.
-     */
-    parseStringGroup(
-        modeName: ArgType,  // Used to describe the mode in error messages.
-        optional: boolean,
-    ): ?Token {
-        const argToken = this.gullet.scanArgument(optional);
-        if (argToken == null) {
-            return null;
-        }
-        let str = "";
-        let nextToken;
-        while ((nextToken = this.fetch()).text !== "EOF") {
-            str += nextToken.text;
-            this.consume();
-        }
-        this.consume(); // consume the end of the argument
-        argToken.text = str;
-        return argToken;
-    }
-
-    /**
-     * Parses a regex-delimited group: the largest sequence of tokens
-     * whose concatenated strings match `regex`. Returns the string
-     * formed by the tokens plus some position information.
-     */
-    parseRegexGroup(
-        regex: RegExp,
-        modeName: string,   // Used to describe the mode in error messages.
-    ): Token {
-        const firstToken = this.fetch();
-        let lastToken = firstToken;
-        let str = "";
-        let nextToken;
-        while ((nextToken = this.fetch()).text !== "EOF" &&
-               regex.test(str + nextToken.text)) {
-            lastToken = nextToken;
-            str += lastToken.text;
-            this.consume();
-        }
-        if (str === "") {
-            throw new ParseError(
-                "Invalid " + modeName + ": '" + firstToken.text + "'",
-                firstToken);
-        }
-        return firstToken.range(lastToken, str);
-    }
-
-    /**
-     * Parses a color description.
-     */
-    parseColorGroup(optional: boolean): ?ParseNode<"color-token"> {
-        const res = this.parseStringGroup("color", optional);
-        if (res == null) {
-            return null;
-        }
-        const match = (
-            /^(#[a-f0-9]{3,4}|#[a-f0-9]{6}|#[a-f0-9]{8}|[a-f0-9]{6}|[a-z]+)$/i
-        ).exec(res.text);
-        if (!match) {
-            throw new ParseError("Invalid color: '" + res.text + "'", res);
-        }
-        let color = match[0];
-        if (/^[0-9a-f]{6}$/i.test(color)) {
-            // We allow a 6-digit HTML color spec without a leading "#".
-            // This follows the xcolor package's HTML color model.
-            // Predefined color names are all missed by this RegEx pattern.
-            color = "#" + color;
-        }
-        return {
-            type: "color-token",
-            mode: this.mode,
-            color,
-        };
-    }
-
-    /**
-     * Parses a size specification, consisting of magnitude and unit.
-     */
-    parseSizeGroup(optional: boolean): ?ParseNode<"size"> {
-        let res;
-        let isBlank = false;
-        // don't expand before parseStringGroup
-        this.gullet.consumeSpaces();
-        if (!optional && this.gullet.future().text !== "{") {
-            res = this.parseRegexGroup(
-                /^[-+]? *(?:$|\d+|\d+\.\d*|\.\d*) *[a-z]{0,2} *$/, "size");
-        } else {
-            res = this.parseStringGroup("size", optional);
-        }
-        if (!res) {
-            return null;
-        }
-        if (!optional && res.text.length === 0) {
-            // Because we've tested for what is !optional, this block won't
-            // affect \kern, \hspace, etc. It will capture the mandatory arguments
-            // to \genfrac and \above.
-            res.text = "0pt";    // Enable \above{}
-            isBlank = true;      // This is here specifically for \genfrac
-        }
-        const match = (/([-+]?) *(\d+(?:\.\d*)?|\.\d+) *([a-z]{2})/).exec(res.text);
-        if (!match) {
-            throw new ParseError("Invalid size: '" + res.text + "'", res);
-        }
-        const data = {
-            number: +(match[1] + match[2]), // sign + magnitude, cast to number
-            unit: match[3],
-        };
-        if (!validUnit(data)) {
-            throw new ParseError("Invalid unit: '" + data.unit + "'", res);
-        }
-        return {
-            type: "size",
-            mode: this.mode,
-            value: data,
-            isBlank,
-        };
-    }
-
-    /**
-     * Parses an URL, checking escaped letters and allowed protocols,
-     * and setting the catcode of % as an active character (as in \hyperref).
-     */
-    parseUrlGroup(optional: boolean): ?ParseNode<"url"> {
-        this.gullet.lexer.setCatcode("%", 13); // active character
-        this.gullet.lexer.setCatcode("~", 12); // other character
-        const res = this.parseStringGroup("url", optional);
-        this.gullet.lexer.setCatcode("%", 14); // comment character
-        this.gullet.lexer.setCatcode("~", 13); // active character
-        if (res == null) {
-            return null;
-        }
-        // hyperref package allows backslashes alone in href, but doesn't
-        // generate valid links in such cases; we interpret this as
-        // "undefined" behaviour, and keep them as-is. Some browser will
-        // replace backslashes with forward slashes.
-        const url = res.text.replace(/\\([#$%&~_^{}])/g, '$1');
-        return {
-            type: "url",
-            mode: this.mode,
-            url,
-        };
-    }
-
-    /**
-     * Parses an argument with the mode specified.
-     */
-    parseArgumentGroup(optional: boolean, mode?: Mode): ?ParseNode<"ordgroup"> {
-        const argToken = this.gullet.scanArgument(optional);
-        if (argToken == null) {
-            return null;
-        }
-        const outerMode = this.mode;
-        if (mode) { // Switch to specified mode
-            this.switchMode(mode);
-        }
-
-        this.gullet.beginGroup();
-        const expression = this.parseExpression(false, "EOF");
-        // TODO: find an alternative way to denote the end
-        this.expect("EOF"); // expect the end of the argument
-        this.gullet.endGroup();
-        const result = {
-            type: "ordgroup",
-            mode: this.mode,
-            loc: argToken.loc,
-            body: expression,
+            if (node.type === "text") {
+                for (let i = 0; i < node.body.length; i++) {
+                    if (node.body[i].type !== "textord") {
+                        return false;
+                    }
+                    chunks.push(node.body[i].text);
+                }
+                return true;
+            }
+            return false;
         };
 
-        if (mode) { // Switch mode back
-            this.switchMode(outerMode);
+        for (let i = 0; i < nodes.length; i++) {
+            if (!walk(nodes[i])) {
+                return null;
+            }
         }
-        return result;
+
+        return chunks.join("");
     }
 
-    /**
-     * Parses an ordinary group, which is either a single nucleus (like "x")
-     * or an expression in braces (like "{x+y}") or an implicit group, a group
-     * that starts at the current position, and ends right before a higher explicit
-     * group ends, or at EOF.
-     */
-    parseGroup(
-        name: string, // For error reporting.
-        breakOnTokenText?: BreakToken,
-    ): ?AnyParseNode {
-        const firstToken = this.fetch();
-        const text = firstToken.text;
-
-        let result;
-        // Try to parse an open brace or \begingroup
-        if (text === "{" || text === "\\begingroup") {
-            this.consume();
-            const groupEnd = text === "{" ? "}" : "\\endgroup";
-
-            this.gullet.beginGroup();
-            // If we get a brace, parse an expression
-            const expression = this.parseExpression(false, groupEnd);
-            const lastToken = this.fetch();
-            this.expect(groupEnd); // Check that we got a matching closing brace
-            this.gullet.endGroup();
-            result = {
-                type: "ordgroup",
-                mode: this.mode,
-                loc: SourceLocation.range(firstToken, lastToken),
-                body: expression,
-                // A group formed by \begingroup...\endgroup is a semi-simple group
-                // which doesn't affect spacing in math mode, i.e., is transparent.
-                // https://tex.stackexchange.com/questions/1930/when-should-one-
-                // use-begingroup-instead-of-bgroup
-                semisimple: text === "\\begingroup" || undefined,
-            };
-        } else {
-            // If there exists a function with this name, parse the function.
-            // Otherwise, just return a nucleus
-            result = this.parseFunction(breakOnTokenText, name) ||
-                this.parseSymbol();
-            if (result == null && text[0] === "\\" &&
-                    !implicitCommands.hasOwnProperty(text)) {
-                if (this.settings.throwOnError) {
-                    throw new ParseError(
-                        "Undefined control sequence: " + text, firstToken);
-                }
-                result = this.formatUnsupportedCmd(text);
-                this.consume();
-            }
+    cloneValue(value: mixed): mixed {
+        if (Array.isArray(value)) {
+            return value.map(item => this.cloneValue(item));
         }
-        return result;
+        if (value && typeof value === "object") {
+            const out = {};
+            const keys = Object.keys((value: Object));
+            for (let i = 0; i < keys.length; i++) {
+                const key = keys[i];
+                // Source locations carry lexer references and are not needed for
+                // substituted bindings.
+                if (key === "loc") {
+                    continue;
+                }
+                out[key] = this.cloneValue(value[key]);
+            }
+            return out;
+        }
+        return value;
     }
 
-    /**
-     * Form ligature-like combinations of characters for text mode.
-     * This includes inputs like "--", "---", "``" and "''".
-     * The result will simply replace multiple textord nodes with a single
-     * character in each value by a single textord node having multiple
-     * characters in its value.  The representation is still ASCII source.
-     * The group will be modified in place.
-     */
-    formLigatures(group: AnyParseNode[]) {
-        let n = group.length - 1;
-        for (let i = 0; i < n; ++i) {
-            const a = group[i];
-            // $FlowFixMe: Not every node type has a `text` property.
-            const v = a.text;
-            if (v === "-" && group[i + 1].text === "-") {
-                if (i + 1 < n && group[i + 2].text === "-") {
-                    group.splice(i, 3, {
-                        type: "textord",
-                        mode: "text",
-                        loc: SourceLocation.range(a, group[i + 2]),
-                        text: "---",
-                    });
-                    n -= 2;
-                } else {
-                    group.splice(i, 2, {
-                        type: "textord",
-                        mode: "text",
-                        loc: SourceLocation.range(a, group[i + 1]),
-                        text: "--",
-                    });
-                    n -= 1;
-                }
-            }
-            if ((v === "'" || v === "`") && group[i + 1].text === v) {
-                group.splice(i, 2, {
-                    type: "textord",
-                    mode: "text",
-                    loc: SourceLocation.range(a, group[i + 1]),
-                    text: v + v,
-                });
-                n -= 1;
-            }
-        }
-    }
-
-    /**
-     * Parse a single symbol out of the string. Here, we handle single character
-     * symbols and special functions like \verb.
-     */
-    parseSymbol(): ?AnyParseNode {
-        const nucleus = this.fetch();
-        let text = nucleus.text;
-
-        if (/^\\verb[^a-zA-Z]/.test(text)) {
-            this.consume();
-            let arg = text.slice(5);
-            const star = (arg.charAt(0) === "*");
-            if (star) {
-                arg = arg.slice(1);
-            }
-            // Lexer's tokenRegex is constructed to always have matching
-            // first/last characters.
-            if (arg.length < 2 || arg.charAt(0) !== arg.slice(-1)) {
-                throw new ParseError(`\\verb assertion failed --
-                    please report what input caused this bug`);
-            }
-            arg = arg.slice(1, -1);  // remove first and last char
-            return {
-                type: "verb",
-                mode: "text",
-                body: arg,
-                star,
-            };
-        }
-        // At this point, we should have a symbol, possibly with accents.
-        // First expand any accented base symbol according to unicodeSymbols.
-        if (unicodeSymbols.hasOwnProperty(text[0]) &&
-            !symbols[this.mode][text[0]]) {
-            // This behavior is not strict (XeTeX-compatible) in math mode.
-            if (this.settings.strict && this.mode === "math") {
-                this.settings.reportNonstrict("unicodeTextInMathMode",
-                    `Accented Unicode text character "${text[0]}" used in ` +
-                    `math mode`, nucleus);
-            }
-            text = unicodeSymbols[text[0]] + text.slice(1);
-        }
-        // Strip off any combining characters
-        const match = combiningDiacriticalMarksEndRegex.exec(text);
-        if (match) {
-            text = text.substring(0, match.index);
-            if (text === 'i') {
-                text = '\u0131';  // dotless i, in math and text mode
-            } else if (text === 'j') {
-                text = '\u0237';  // dotless j, in math and text mode
-            }
-        }
-        // Recognize base symbol
-        let symbol: AnyParseNode;
-        if (symbols[this.mode][text]) {
-            if (this.settings.strict && this.mode === 'math' &&
-                extraLatin.includes(text)) {
-                this.settings.reportNonstrict("unicodeTextInMathMode",
-                    `Latin-1/Unicode text character "${text[0]}" used in ` +
-                    `math mode`, nucleus);
-            }
-            const group: Group = symbols[this.mode][text].group;
-            const loc = SourceLocation.range(nucleus);
-            let s: SymbolParseNode;
-            if (ATOMS.hasOwnProperty(group)) {
-                // $FlowFixMe
-                const family: Atom = group;
-                s = {
-                    type: "atom",
-                    mode: this.mode,
-                    family,
-                    loc,
-                    text,
-                };
-            } else {
-                // $FlowFixMe
-                s = {
-                    type: group,
-                    mode: this.mode,
-                    loc,
-                    text,
-                };
-            }
-            // $FlowFixMe
-            symbol = s;
-        } else if (text.charCodeAt(0) >= 0x80) { // no symbol for e.g. ^
-            if (this.settings.strict) {
-                if (!supportedCodepoint(text.charCodeAt(0))) {
-                    this.settings.reportNonstrict("unknownSymbol",
-                        `Unrecognized Unicode character "${text[0]}"` +
-                        ` (${text.charCodeAt(0)})`, nucleus);
-                } else if (this.mode === "math") {
-                    this.settings.reportNonstrict("unicodeTextInMathMode",
-                        `Unicode text character "${text[0]}" used in math mode`,
-                        nucleus);
-                }
-            }
-            // All nonmathematical Unicode characters are rendered as if they
-            // are in text mode (wrapped in \text) because that's what it
-            // takes to render them in LaTeX.  Setting `mode: this.mode` is
-            // another natural choice (the user requested math mode), but
-            // this makes it more difficult for getCharacterMetrics() to
-            // distinguish Unicode characters without metrics and those for
-            // which we want to simulate the letter M.
-            symbol = {
-                type: "textord",
-                mode: "text",
-                loc: SourceLocation.range(nucleus),
-                text,
-            };
-        } else {
-            return null;  // EOF, ^, _, {, }, etc.
-        }
-        this.consume();
-        // Transform combining characters into accents
-        if (match) {
-            for (let i = 0; i < match[0].length; i++) {
-                const accent: string = match[0][i];
-                if (!unicodeAccents[accent]) {
-                    throw new ParseError(`Unknown accent ' ${accent}'`, nucleus);
-                }
-                const command = unicodeAccents[accent][this.mode] ||
-                    unicodeAccents[accent].text;
-                if (!command) {
-                    throw new ParseError(
-                        `Accent ${accent} unsupported in ${this.mode} mode`,
-                        nucleus);
-                }
-                symbol = {
-                    type: "accent",
-                    mode: this.mode,
-                    loc: SourceLocation.range(nucleus),
-                    label: command,
-                    isStretchy: false,
-                    isShifty: true,
-                    // $FlowFixMe
-                    base: symbol,
-                };
-            }
-        }
-        // $FlowFixMe
-        return symbol;
+    cloneNodes(nodes: AnyParseNode[]): AnyParseNode[] {
+        return nodes.map(node => ((this.cloneValue(node): any): AnyParseNode));
     }
 }

@@ -202,9 +202,7 @@ describe("renderA11yString", () => {
 
         test("a_{n+1}", () => {
             const result = renderA11yString("a_{n+1}");
-            expect(result).toMatchInlineSnapshot(
-                `"a, start subscript, n, plus, 1, end subscript"`,
-            );
+            expect(result).toMatchInlineSnapshot(`"a, _, n, plus, 1"`);
         });
     });
 

@@ -7,6 +7,17 @@ import SourceLocation from "./SourceLocation";
  */
 export interface LexerInterface {input: string, tokenRegex: RegExp}
 
+// Token categories used by the Typst-oriented lexer/parser pipeline.
+export type TokenKind =
+    "identifier" |
+    "number" |
+    "string" |
+    "operator" |
+    "punctuation" |
+    "space" |
+    "EOF" |
+    "legacy";
+
 /**
  * The resulting token returned from `lex`.
  *
@@ -22,6 +33,7 @@ export interface LexerInterface {input: string, tokenRegex: RegExp}
  */
 export class Token {
     text: string;
+    kind: TokenKind;
     loc: ?SourceLocation;
     noexpand: ?boolean; // don't expand the token
     treatAsRelax: ?boolean; // used in \noexpand
@@ -29,9 +41,11 @@ export class Token {
     constructor(
         text: string,           // the text of this token
         loc: ?SourceLocation,
+        kind?: TokenKind = "legacy",
     ) {
         this.text = text;
         this.loc = loc;
+        this.kind = kind;
     }
 
     /**

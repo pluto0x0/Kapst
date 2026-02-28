@@ -1,15 +1,10 @@
 // @flow
 /**
- * The Lexer class handles tokenizing the input in various ways. Since our
- * parser expects us to be able to backtrack, the lexer allows lexing from any
- * given starting point.
+ * Typst-oriented lexer.
  *
- * Its main exposed function is the `lex` function, which takes a position to
- * lex from and a type of token to lex. It defers to the appropriate `_innerLex`
- * function.
- *
- * The various `_innerLex` functions perform the actual lexing of different
- * kinds.
+ * We intentionally tokenize a compact expression language (identifiers,
+ * numbers, strings, operators, punctuation) and leave semantic mapping to the
+ * parser. The renderer pipeline is still KaTeX's existing AST + builders.
  */
 
 import ParseError from "./ParseError";
@@ -19,104 +14,256 @@ import {Token} from "./Token";
 import type {LexerInterface} from "./Token";
 import type Settings from "./Settings";
 
-/* The following tokenRegex
- * - matches typical whitespace (but not NBSP etc.) using its first group
- * - does not match any control character \x00-\x1f except whitespace
- * - does not match a bare backslash
- * - matches any ASCII character except those just mentioned
- * - does not match the BMP private use area \uE000-\uF8FF
- * - does not match bare surrogate code units
- * - matches any BMP character except for those just described
- * - matches any valid Unicode surrogate pair
- * - matches a backslash followed by one or more whitespace characters
- * - matches a backslash followed by one or more letters then whitespace
- * - matches a backslash followed by any BMP character
- * Capturing groups:
- *   [1] regular whitespace
- *   [2] backslash followed by whitespace
- *   [3] anything else, which may include:
- *     [4] left character of \verb*
- *     [5] left character of \verb
- *     [6] backslash followed by word, excluding any trailing whitespace
- * Just because the Lexer matches something doesn't mean it's valid input:
- * If there is no matching function or symbol definition, the Parser will
- * still reject the input.
- */
-const spaceRegexString = "[ \r\n\t]";
-const controlWordRegexString = "\\\\[a-zA-Z@]+";
-const controlSymbolRegexString = "\\\\[^\uD800-\uDFFF]";
-const controlWordWhitespaceRegexString =
-    `(${controlWordRegexString})${spaceRegexString}*`;
-const controlSpaceRegexString = "\\\\(\n|[ \r\t]+\n?)[ \r\t]*";
-const combiningDiacriticalMarkString = "[\u0300-\u036f]";
+// Kept for compatibility with previous imports in this codebase.
 export const combiningDiacriticalMarksEndRegex: RegExp =
-    new RegExp(`${combiningDiacriticalMarkString}+$`);
-const tokenRegexString = `(${spaceRegexString}+)|` +  // whitespace
-    `${controlSpaceRegexString}|` +                   // \whitespace
-    "([!-\\[\\]-\u2027\u202A-\uD7FF\uF900-\uFFFF]" +  // single codepoint
-    `${combiningDiacriticalMarkString}*` +            // ...plus accents
-    "|[\uD800-\uDBFF][\uDC00-\uDFFF]" +               // surrogate pair
-    `${combiningDiacriticalMarkString}*` +            // ...plus accents
-    "|\\\\verb\\*([^]).*?\\4" +                       // \verb*
-    "|\\\\verb([^*a-zA-Z]).*?\\5" +                   // \verb unstarred
-    `|${controlWordWhitespaceRegexString}` +          // \macroName + spaces
-    `|${controlSymbolRegexString})`;                  // \\, \', etc.
+    /[\u0300-\u036f]+$/;
+
+const MULTI_CHAR_OPERATORS = [
+    "<=>", "<->", "=>", "->", "<-", "<=", ">=", "!=", "==",
+];
+const SINGLE_CHAR_OPERATORS = new Set([
+    "+", "-", "*", "/", "^", "_", "=", "<", ">", "!",
+]);
+const PUNCTUATION = new Set([
+    ",", ":", ";", ".", "(", ")", "[", "]", "{", "}", "|",
+]);
 
 /** Main Lexer class */
 export default class Lexer implements LexerInterface {
     input: string;
     settings: Settings;
     tokenRegex: RegExp;
-    // Category codes. The lexer only supports comment characters (14) for now.
-    // MacroExpander additionally distinguishes active (13).
     catcodes: {[string]: number};
+    pos: number;
 
     constructor(input: string, settings: Settings) {
-        // Separate accents from characters
         this.input = input;
         this.settings = settings;
-        this.tokenRegex = new RegExp(tokenRegexString, 'g');
-        this.catcodes = {
-            "%": 14, // comment character
-            "~": 13, // active character
-        };
+        // SourceLocation expects a lexer-like object to carry `tokenRegex`.
+        this.tokenRegex = /\s*/g;
+        this.catcodes = {};
+        this.pos = 0;
     }
 
     setCatcode(char: string, code: number) {
+        // Kept for compatibility with legacy callers.
         this.catcodes[char] = code;
     }
 
+    skipTrivia() {
+        while (this.pos < this.input.length) {
+            const ch = this.input[this.pos];
+
+            if (ch === " " || ch === "\n" || ch === "\r" || ch === "\t") {
+                this.pos += 1;
+                continue;
+            }
+
+            // Line comments.
+            if (ch === "/" && this.input[this.pos + 1] === "/") {
+                this.pos += 2;
+                while (this.pos < this.input.length &&
+                    this.input[this.pos] !== "\n") {
+                    this.pos += 1;
+                }
+                continue;
+            }
+
+            // Block comments.
+            if (ch === "/" && this.input[this.pos + 1] === "*") {
+                const commentStart = this.pos;
+                this.pos += 2;
+                while (this.pos + 1 < this.input.length &&
+                    !(this.input[this.pos] === "*" &&
+                    this.input[this.pos + 1] === "/")) {
+                    this.pos += 1;
+                }
+                if (this.pos + 1 >= this.input.length) {
+                    const commentLoc = new SourceLocation(
+                        this,
+                        commentStart,
+                        commentStart + 2,
+                    );
+                    throw new ParseError(
+                        "Unterminated block comment",
+                        new Token("/*", commentLoc, "operator"),
+                    );
+                }
+                this.pos += 2;
+                continue;
+            }
+
+            break;
+        }
+    }
+
+    lexIdentifierOrKeyword(start: number): Token {
+        this.pos += 1;
+        while (this.pos < this.input.length &&
+            /[A-Za-z0-9_]/.test(this.input[this.pos])) {
+            this.pos += 1;
+        }
+        const text = this.input.slice(start, this.pos);
+        return new Token(
+            text,
+            new SourceLocation(this, start, this.pos),
+            "identifier",
+        );
+    }
+
+    lexNumber(start: number): Token {
+        let sawDot = false;
+
+        if (this.input[this.pos] === ".") {
+            sawDot = true;
+            this.pos += 1;
+        }
+
+        while (this.pos < this.input.length) {
+            const ch = this.input[this.pos];
+            if (/[0-9]/.test(ch)) {
+                this.pos += 1;
+                continue;
+            }
+            if (!sawDot && ch === ".") {
+                sawDot = true;
+                this.pos += 1;
+                continue;
+            }
+            break;
+        }
+
+        const text = this.input.slice(start, this.pos);
+        return new Token(
+            text,
+            new SourceLocation(this, start, this.pos),
+            "number",
+        );
+    }
+
+    lexString(start: number): Token {
+        const quote = this.input[this.pos];
+        this.pos += 1;
+
+        let text = "";
+        while (this.pos < this.input.length) {
+            const ch = this.input[this.pos];
+            if (ch === quote) {
+                this.pos += 1;
+                return new Token(
+                    text,
+                    new SourceLocation(this, start, this.pos),
+                    "string",
+                );
+            }
+            if (ch === "\\") {
+                if (this.pos + 1 >= this.input.length) {
+                    break;
+                }
+                const escaped = this.input[this.pos + 1];
+                switch (escaped) {
+                    case "n":
+                        text += "\n";
+                        break;
+                    case "r":
+                        text += "\r";
+                        break;
+                    case "t":
+                        text += "\t";
+                        break;
+                    case "\\":
+                    case "\"":
+                    case "'":
+                        text += escaped;
+                        break;
+                    default:
+                        // Keep unknown escapes literally to avoid silent data loss.
+                        text += escaped;
+                }
+                this.pos += 2;
+                continue;
+            }
+            text += ch;
+            this.pos += 1;
+        }
+
+        throw new ParseError(
+            "Unterminated string literal",
+            new Token(quote, new SourceLocation(this, start, start + 1), "string"),
+        );
+    }
+
+    lexOperatorOrPunctuation(start: number): ?Token {
+        for (let i = 0; i < MULTI_CHAR_OPERATORS.length; i++) {
+            const op = MULTI_CHAR_OPERATORS[i];
+            if (this.input.startsWith(op, start)) {
+                this.pos += op.length;
+                return new Token(
+                    op,
+                    new SourceLocation(this, start, this.pos),
+                    "operator",
+                );
+            }
+        }
+
+        const ch = this.input[start];
+        if (SINGLE_CHAR_OPERATORS.has(ch)) {
+            this.pos += 1;
+            return new Token(
+                ch,
+                new SourceLocation(this, start, this.pos),
+                "operator",
+            );
+        }
+        if (PUNCTUATION.has(ch)) {
+            this.pos += 1;
+            return new Token(
+                ch,
+                new SourceLocation(this, start, this.pos),
+                "punctuation",
+            );
+        }
+        return null;
+    }
+
     /**
-     * This function lexes a single token.
+     * Lex a single token.
      */
     lex(): Token {
-        const input = this.input;
-        const pos = this.tokenRegex.lastIndex;
-        if (pos === input.length) {
-            return new Token("EOF", new SourceLocation(this, pos, pos));
-        }
-        const match = this.tokenRegex.exec(input);
-        if (match === null || match.index !== pos) {
-            throw new ParseError(
-                `Unexpected character: '${input[pos]}'`,
-                new Token(input[pos], new SourceLocation(this, pos, pos + 1)));
-        }
-        const text = match[6] || match[3] || (match[2] ? "\\ " : " ");
+        this.skipTrivia();
 
-        if (this.catcodes[text] === 14) { // comment character
-            const nlIndex = input.indexOf('\n', this.tokenRegex.lastIndex);
-            if (nlIndex === -1) {
-                this.tokenRegex.lastIndex = input.length; // EOF
-                this.settings.reportNonstrict("commentAtEnd",
-                    "% comment has no terminating newline; LaTeX would " +
-                    "fail because of commenting the end of math mode (e.g. $)");
-            } else {
-                this.tokenRegex.lastIndex = nlIndex + 1;
-            }
-            return this.lex();
+        const start = this.pos;
+        if (start >= this.input.length) {
+            return new Token(
+                "EOF",
+                new SourceLocation(this, start, start),
+                "EOF",
+            );
         }
 
-        return new Token(text, new SourceLocation(this, pos,
-            this.tokenRegex.lastIndex));
+        const ch = this.input[start];
+
+        if (/[A-Za-z_]/.test(ch)) {
+            return this.lexIdentifierOrKeyword(start);
+        }
+
+        if (/[0-9]/.test(ch) ||
+            (ch === "." && /[0-9]/.test(this.input[start + 1] || ""))) {
+            return this.lexNumber(start);
+        }
+
+        if (ch === '"' || ch === "'") {
+            return this.lexString(start);
+        }
+
+        const opOrPunctuation = this.lexOperatorOrPunctuation(start);
+        if (opOrPunctuation) {
+            return opOrPunctuation;
+        }
+
+        throw new ParseError(
+            `Unexpected character: '${ch}'`,
+            new Token(ch, new SourceLocation(this, start, start + 1), "legacy"),
+        );
     }
 }
